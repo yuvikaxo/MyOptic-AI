@@ -1,71 +1,121 @@
 import os
 import pandas as pd
 import numpy as np
-import cv2
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import torchvision.transforms as transforms
+from torch.utils.data import DataLoader, Dataset
+from PIL import Image
 from sklearn.model_selection import train_test_split
-import matplotlib.pyplot as plt
-import tensorflow as tf
-from tensorflow.keras.models import Sequential
-from tensorflow.keras.layers import Conv2D, MaxPooling2D, Flatten, Dense, Dropout
-from tensorflow.keras.preprocessing.image import ImageDataGenerator, load_img, img_to_array
 
-DATASET_PATH= r"C:\Users\DELL\Desktop\CNN-Myopia\PALM_Dataset\Training\Images"
-LABELS_PATH= r"C:\Users\DELL\Desktop\CNN-Myopia\PALM_Dataset\Training\Labels.csv"
+# Set device
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
+# Paths
+DATASET_PATH = r"C:\Users\DELL\Desktop\CNN-Myopia1\PALM_Dataset\Training\Images"
+LABELS_PATH = r"C:\Users\DELL\Desktop\CNN-Myopia1\PALM_Dataset\Training\Labels.csv"
+
+# Read CSV file
 df = pd.read_csv(LABELS_PATH, header=None, names=["imgName", "Label"])
 
-IMG_SIZE=(224,224)
-
-X,y=[],[]
-
-for index, row in df.iterrows():
-    img_path = os.path.join(DATASET_PATH, row["imgName"])  # Full path to image
-    
-    if os.path.exists(img_path):  # Check if the image file exists
-        img = cv2.imread(img_path)  # Read image using OpenCV
-        img = cv2.resize(img, IMG_SIZE)  # Resize image to 224x224
-        img = img / 255.0  # Normalize pixel values to range [0,1]
-        
-        X.append(img)
-        y.append(row["Label"])  # Store label
-
-X = np.array(X)
-y = np.array(y)
-
-X_train, X_temp, y_train, y_temp = train_test_split(X, y, test_size=0.2, random_state=42)
-X_val, X_test, y_val, y_test = train_test_split(X_temp, y_temp, test_size=0.5, random_state=42)
-
-# Print dataset shapes
-print(f"Training Set: {X_train.shape}, Labels: {y_train.shape}")
-print(f"Validation Set: {X_val.shape}, Labels: {y_val.shape}")
-print(f"Test Set: {X_test.shape}, Labels: {y_test.shape}")
-
-# Display a sample image
-plt.imshow(X_train[0])
-plt.title(f"Label: {y_train[0]}")
-plt.show()
-
-# Build CNN Model
-model = Sequential([
-    Conv2D(32, (3,3), activation="relu", input_shape=(224, 224, 3)),
-    MaxPooling2D(2,2),
-    Conv2D(64, (3,3), activation="relu"),
-    MaxPooling2D(2,2),
-    Flatten(),
-    Dense(128, activation="relu"),
-    Dropout(0.5),
-    Dense(1, activation="sigmoid")  # Use 'softmax' if multi-class
+# Transformations
+transform = transforms.Compose([
+    transforms.Resize((224, 224)),
+    transforms.ToTensor(),
+    transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5])
 ])
 
-model.compile(optimizer="adam", loss="binary_crossentropy", metrics=["accuracy"])
+# Custom Dataset
+class MyopiaDataset(Dataset):
+    def __init__(self, dataframe, root_dir, transform=None):
+        self.dataframe = dataframe
+        self.root_dir = root_dir
+        self.transform = transform
 
-# Train Model
-history = model.fit(X_train, y_train, epochs=10, validation_data=(X_test, y_test), batch_size=32)
+    def __len__(self):
+        return len(self.dataframe)
 
-# Save Model
-model.save("myopia_classifier.h5")
+    def __getitem__(self, idx):
+        img_name = self.dataframe.iloc[idx, 0]
+        img_path = os.path.join(self.root_dir, img_name)
 
-plt.plot(history.history['accuracy'], label="Train Accuracy")
-plt.plot(history.history['val_accuracy'], label="Validation Accuracy")
-plt.legend()
-plt.show()
+        if not os.path.exists(img_path):  
+            print(f"Warning: {img_path} not found. Skipping...")
+            return None  # Return None if image is missing
+
+        image = Image.open(img_path).convert("RGB")
+        label = torch.tensor(float(self.dataframe.iloc[idx, 1]), dtype=torch.float)
+
+        if self.transform:
+            image = self.transform(image)
+
+        return image, label
+
+# Split dataset
+train_df, temp_df = train_test_split(df, test_size=0.2, random_state=42)
+val_df, test_df = train_test_split(temp_df, test_size=0.5, random_state=42)
+
+# Create Datasets and DataLoaders
+train_dataset = MyopiaDataset(train_df, DATASET_PATH, transform=transform)
+val_dataset = MyopiaDataset(val_df, DATASET_PATH, transform=transform)
+test_dataset = MyopiaDataset(test_df, DATASET_PATH, transform=transform)
+
+train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True)
+val_loader = DataLoader(val_dataset, batch_size=32, shuffle=False)
+test_loader = DataLoader(test_dataset, batch_size=32, shuffle=False)
+
+# Define CNN Model
+class MyopiaClassifier(nn.Module):
+    def __init__(self):
+        super(MyopiaClassifier, self).__init__()
+        self.conv_layers = nn.Sequential(
+            nn.Conv2d(3, 32, kernel_size=3, stride=1, padding=1),
+            nn.ReLU(),
+            nn.MaxPool2d(kernel_size=2, stride=2),
+            nn.Conv2d(32, 64, kernel_size=3, stride=1, padding=1),
+            nn.ReLU(),
+            nn.MaxPool2d(kernel_size=2, stride=2),
+        )
+        self.fc_layers = nn.Sequential(
+            nn.Linear(64 * 56 * 56, 128),
+            nn.ReLU(),
+            nn.Dropout(0.5),
+            nn.Linear(128, 1)
+        )
+
+    def forward(self, x):
+        x = self.conv_layers(x)
+        x = torch.flatten(x, start_dim=1)
+        x = self.fc_layers(x)
+        return x  # Output raw logits
+
+# Initialize model
+model = MyopiaClassifier().to(device)
+criterion = nn.BCEWithLogitsLoss()  # Use BCEWithLogitsLoss instead of BCELoss
+optimizer = optim.Adam(model.parameters(), lr=0.001)
+
+# Training loop
+epochs = 10
+for epoch in range(epochs):
+    model.train()
+    running_loss = 0.0
+    
+    for batch in train_loader:
+        if batch is None:
+            continue  # Skip None values from missing images
+        images, labels = batch
+        images, labels = images.to(device), labels.to(device).unsqueeze(1).float()
+
+        optimizer.zero_grad()
+        outputs = model(images)
+        loss = criterion(outputs, labels)
+        loss.backward()
+        optimizer.step()
+
+        running_loss += loss.item()
+
+    print(f"Epoch {epoch+1}/{epochs}, Loss: {running_loss/len(train_loader)}")
+
+# Save model
+torch.save(model.state_dict(), "myopia_classifier.pth")
